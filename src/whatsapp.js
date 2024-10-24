@@ -37,18 +37,26 @@ let sock = []
 let qrcode = []
 let intervalStore = []
 
+const useCode = !process.argv.includes('--code')
+
 async function connectToWhatsApp(sender, io = null) {
     const { state, saveCreds } = await useMultiFileAuthState(`./credentials/${sender}`)
 
     sock[sender] = makeWASocket({
         browser: ['AyasyaTech', "Chrome", ""],
         logger: pino,
-        printQRInTerminal: true,
+        printQRInTerminal: !useCode,
         auth: {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, pino)
         }
     })
+
+    if (useCode && !sock[sender].authState.creds.registered) {
+        const phoneNumber = await question('Please Enter Your Phone Number:\n')
+        const code = await sock[sender].requestPairingCode(phoneNumber)
+        console.log(`Pairing Code: ${code}`)
+    }
 
     sock[sender].ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
         if (connection === 'connecting') {
