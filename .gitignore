@@ -2,3 +2,4 @@
 /credentials
 /logs
 yarn.lock
+.env
