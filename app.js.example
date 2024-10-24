@@ -1,0 +1,123 @@
+import wa from "@whiskeysockets/baileys"
+import readline from "readline"
+import P from "pino"
+const {
+    makeWASocket,
+    BinaryInfo,
+    delay,
+    DisconnectReason,
+    downloadAndProcessHistorySyncNotification,
+    encodeWAM,
+    fetchLatestBaileysVersion,
+    getAggregateVotesInPollMessage,
+    getHistoryMsg,
+    isJidNewsletter,
+    makeCacheableSignalKeyStore,
+    makeInMemoryStore,
+    proto,
+    useMultiFileAuthState
+} = wa
+
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
+const question = (text) => new Promise((resolve) => rl.question(text, resolve))
+
+const logger = P({ timestamp: () => `,"time":"${new Date().toJSON()}"` }, P.destination('./logs/wa-logs.txt'))
+logger.level = 'trace'
+
+const usePairingCode = process.argv.includes('--use-pairing-code')
+
+async function connectToWhatsApp() {
+    const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info')
+
+    const sock = makeWASocket({
+        // can provide additional config here
+        logger,
+        auth: state,
+        printQRInTerminal: !usePairingCode,
+        defaultQueryTimeoutMs: undefined,
+        asyncFullHistory: false,
+    })
+
+    if (usePairingCode && !sock.user && !sock.authState.creds.registered) {
+        async function connectWithCode() {
+            let phoneNumber = ""
+            if (!phoneNumber) {
+                phoneNumber = await question("Enter your phone number (e.g. 62895347111): +")
+            }
+
+            try {
+                let code = await sock.requestPairingCode(phoneNumber)
+                code = code?.match(/.{1,4}/g).join("-") || code
+                console.log(code)
+            } catch (error) {
+                console.log(error)
+            }
+        }
+
+        await connectWithCode()
+    }
+
+    sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect } = update
+
+        if (connection === "close") {
+            console.log(lastDisconnect)
+            connectToWhatsApp()
+        }
+
+        if (connection === "open") {
+            console.log(sock.user.id.split(":")[0])
+        }
+
+    })
+
+    sock.ev.on("creds.update", saveCreds)
+}
+// run in main file
+connectToWhatsApp()
+
+    // const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info')
+
+    // const sock = makeWASocket({
+    //     // can provide additional config here
+    //     logger,
+    //     auth: state,
+    //     printQRInTerminal: type,
+    //     defaultQueryTimeoutMs: undefined,
+    //     asyncFullHistory: false,
+    // })
+
+    // if (usePairingCode && !sock.user && !sock.authState.creds.registered) {
+    //     async function connectWithCode() {
+    //         let phoneNumber = ""
+    //         if (!phoneNumber) {
+    //             phoneNumber = await question("Enter your phone number (e.g. 62895347111): +")
+    //         }
+
+    //         try {
+    //             let code = await sock.requestPairingCode(phoneNumber)
+    //             code = code?.match(/.{1,4}/g).join("-") || code
+    //             console.log(code)
+    //         } catch (error) {
+    //             console.log(error)
+    //         }
+    //     }
+
+    //     await connectWithCode()
+    // }
+
+    // sock.ev.on('connection.update', (update) => {
+    //     const { connection, lastDisconnect } = update
+
+    //     if (connection === "close") {
+    //         console.log(lastDisconnect)
+    //         connectToWhatsApp()
+    //     }
+
+    //     if (connection === "open") {
+    //         console.log(sock.user.id.split(":")[0])
+    //     }
+
+    // })
+
+    // sock.ev.on("creds.update", saveCreds)

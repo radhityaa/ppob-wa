@@ -1,0 +1,36 @@
+import 'dotenv/config.js'
+import { connectToWhatsApp } from './whatsapp/index.js'
+import express from "express"
+import http from "http"
+import { Server } from 'socket.io'
+import bodyParser from 'body-parser'
+
+const app = express()
+const server = http.createServer(app)
+
+// SocketIo
+const io = new Server(server)
+const port = process.env.PORT_SERVER
+
+app.use((req, res, next) => {
+    res.set('Cache-control', 'no-store')
+    req.io = io
+    next()
+})
+
+app.use(bodyParser.urlencoded({ extended: false, limit: '50mb', parameterLimit: 100000 }))
+app.use(bodyParser.json())
+app.use(express.static('./public'))
+app.use(require('./routes/index.js'))
+
+io.on('connection', (socket) => {
+    socket.on('startConnection', (data) => {
+        connectToWhatsApp(data, io)
+    })
+
+    // socket.on('logoutDevice', (device) => {
+    //     deleteCredentials(device, io)
+    // })
+})
+
+server.listen(port, console.log(`Server running on port: ${port}`))

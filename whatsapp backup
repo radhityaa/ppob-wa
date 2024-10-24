@@ -1,0 +1,393 @@
+import wa from "@whiskeysockets/baileys"
+import P from "pino"
+import readline from "readline"
+import QRCode from "qrcode"
+import { Boom } from "@hapi/boom"
+import formatReceipt from "../lib/formatReceipt.js"
+import fs from "fs"
+const {
+    makeWASocket,
+    BinaryInfo,
+    delay,
+    DisconnectReason,
+    downloadAndProcessHistorySyncNotification,
+    encodeWAM,
+    fetchLatestBaileysVersion,
+    getAggregateVotesInPollMessage,
+    getHistoryMsg,
+    isJidNewsletter,
+    makeCacheableSignalKeyStore,
+    makeInMemoryStore,
+    proto,
+    useMultiFileAuthState
+} = wa
+
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
+const question = (text) => new Promise((resolve) => rl.question(text, resolve))
+
+const logger = P({ timestamp: () => `,"time":"${new Date().toJSON()}"` }, P.destination('./logs/wa-logs.txt'))
+logger.level = 'trace'
+
+const usePairingCode = process.argv.includes('--use-pairing-code')
+
+let sock = []
+let qrcode = []
+let intervalStore = []
+
+async function connectToWhatsApp(token, io = null) {
+
+    if (typeof qrcode[token] !== "undefined") {
+        if (io !== null) {
+            io.emit("qrcode", {
+                token,
+                data: qrcode[token],
+                message: "Please scan with your whatsapp"
+            })
+        }
+
+        return {
+            succes: false,
+            sock: sock[token],
+            qrcode: qrcode[token],
+            message: 'Please scan QRCode with your whatsapp'
+        }
+    }
+
+    try {
+        let number = sock[token].user.id.split(":")
+        number = number[0] + "@s.whatsapp.net"
+
+        if (io !== null) {
+            io.emit("connection-open", {
+                token,
+                user: sock[token].user,
+            })
+            console.log(sock[token].user)
+        }
+
+        return {
+            success: true,
+            message: "Already connected"
+        }
+    } catch (error) {
+        if (io !== null) {
+            io.emit("connection-error", {
+                token,
+                error: error.message,
+            })
+        }
+    }
+
+    const { version, isLatest } = await fetchLatestBaileysVersion()
+    console.log(`WhatsApp version: ${version}, is latest: ${isLatest}`)
+
+    const { state, saveCreds } = await useMultiFileAuthState(`./credentials/${token}`)
+
+    sock[token] = makeWASocket({
+        version,
+        browser: ["AyasyaTech", "Chrome", "103.0.5060.114"],
+        logger,
+        printQRInTerminal: true,
+        patchMessageBeforeSending: (message) => {
+            const requiresMobileStructuralPatch = Boolean(
+                message?.buttonsMessage ||
+                message?.templateMessage ||
+                message?.listMessage
+            );
+
+            if (message?.templateMessage) {
+                message.templateMessage.hydratedFourRowTemplate = _.cloneDeep(
+                    message.templateMessage.hydratedTemplate
+                );
+                delete message.templateMessage.fourRowTemplate;
+            }
+
+            if (message?.deviceSentMessage?.message?.templateMessage) {
+                message.deviceSentMessage.message.templateMessage.hydratedFourRowTemplate =
+                    _.cloneDeep(
+                        message.deviceSentMessage.message.templateMessage
+                            .hydratedTemplate
+                    );
+                delete message.deviceSentMessage.message.templateMessage
+                    .fourRowTemplate;
+            }
+
+            if (requiresMobileStructuralPatch) {
+                message = {
+                    viewOnceMessage: {
+                        message: {
+                            messageContextInfo: {
+                                deviceListMetadataVersion: 2,
+                                deviceListMetadata: {},
+                            },
+                            ...message,
+                        },
+                    },
+                };
+            }
+
+            return message;
+        },
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, logger)
+        }
+    })
+
+    sock[token].ev.process(async (events) => {
+        if (events["connection.update"]) {
+            const update = events["connection.update"]
+            const { connection, lastDisconnect, qr } = update
+            if (connection === "close") {
+                console.log("close");
+                if ((lastDisconnect?.error instanceof Boom)?.output?.statusCode !== DisconnectReason.loggedOut) {
+                    delete qrcode[token];
+                    if (io != null)
+                        io.emit("message", {
+                            token: token,
+                            message: "Connecting..",
+                        });
+                    if (lastDisconnect.error?.output?.payload?.message === "QR refs attempts ended") {
+                        delete qrcode[token];
+                        sock[token].ws.close();
+                        if (io != null)
+                            io.emit("message", {
+                                token: token,
+                                message:
+                                    "Request QR ended. reload scan to request QR again",
+                            });
+                        return;
+                    }
+                    if (lastDisconnect?.error.output.payload.message != "Stream Errored (conflict)") {
+                        connectToWhatsApp(token, io);
+                    }
+                } else {
+                    console.log("Connection closed. You are logged out.");
+                    if (io !== null) {
+                        io.emit("message", {
+                            token,
+                            message: "Connection closed. You are logged out.",
+                        });
+                    }
+                    clearConnection(token);
+                }
+            }
+
+            if (qr) {
+                QRCode.toDataURL(qr, function (err, url) {
+                    if (err) {
+                        console.log(err);
+                    }
+                    qrcode[token] = url;
+                    if (io !== null) {
+                        io.emit("qrcode", {
+                            token,
+                            data: url,
+                            message: "Please scan with your Whatsapp Account",
+                        });
+                    }
+                });
+            }
+
+            if (connection === "open") {
+                let number = sock[token].user.id.split(":")
+                number = number[0] + "@s.whatsapp.net"
+                const ppUrl = await getPpUrl(token, number)
+
+                if (io !== null) {
+                    io.emit("connection-open", {
+                        token,
+                        user: sock[token].user,
+                        picture: ppUrl
+                    })
+                }
+                delete qrcode[token]
+            }
+        }
+
+        if (events["messages.upsert"]) {
+            const messages = events["messages.upsert"]
+            // IncomingMessage(messages, sock[token])
+        }
+
+        if (events["creds.update"]) {
+            const creds = events["creds.update"]
+            saveCreds(creds)
+        }
+    })
+
+    return {
+        sock: sock[token],
+        qrcode: qrcode[token],
+    };
+}
+
+const sendTextMessage = async (token, number, msg) => {
+    try {
+        const sendingMessage = await sock[token].sendMessage(formatReceipt(number), { text: msg }, { quoted: msg })
+        return sendingMessage
+    } catch (error) {
+        console.log(error)
+        return false
+    }
+}
+
+const getPpUrl = async (token, number) => {
+    let url
+    try {
+        url = await sock[token].profilePictureUrl(number)
+        return url
+    } catch (e) {
+        return "https://upload.wikimedia.org/wikipedia/commons/thumb/6/6b/WhatsApp.svg/1200px-WhatsApp.svg.png";
+    }
+}
+
+function clearConnection() {
+    clearInterval(intervalStore[token])
+
+    delete sock[token]
+    delete qrcode[token]
+    setStatus(token, "Disconnect")
+    if (fs.existsSync(`./credentials/${token}`)) {
+        fs.rmSync(
+            `./credentials/${token}`,
+            { recursive: true, force: true },
+            (err) => {
+                if (err) console.log(err)
+            }
+        )
+        console.log(`credentials/${token} is deleted`)
+    }
+}
+
+async function connectWaBeforeSend(token) {
+    let status = undefined
+    let connect
+    connect = await connectToWhatsApp(token)
+
+    await connect.sock.ev.on("connection.update", (con) => {
+        const { connection, qr } = con
+        if (connection === "open") {
+            status = true
+        }
+        if (qr) {
+            status = false
+        }
+    })
+
+    let counter = 0
+    while (typeof status === "undefined") {
+        counter++
+        if (counter > 4) {
+            break
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1000))
+    }
+
+    return status;
+}
+
+async function isExist(token, number) {
+    if (typeof sock[token] === "undefined") {
+        const status = await connectWaBeforeSend(token)
+        if (!status) {
+            return false
+        }
+    }
+    try {
+        if (number.includes("@g.us")) {
+            return true;
+        } else {
+            const [result] = await sock[token].onWhatsApp(number);
+
+            return result;
+        }
+    } catch (error) {
+        return false;
+    }
+}
+
+async function getGroup(token) {
+    try {
+        const groups = await sock[token].groupFetchAllParticipating()
+        return groups;
+    } catch (error) {
+        console.log(error)
+    }
+}
+
+async function checkUserToken(token) {
+    try {
+        const user = await sock[token].user
+        return { user };
+    } catch (error) {
+        console.log(error)
+    }
+}
+
+async function getContacts(token) {
+    sock[token].ev.on("contacts.upsert", (events) => {
+        console.log('Got contacts', Object.values(store.contacts))
+    })
+}
+
+async function logoutDevice(token, io = null) {
+    if (io !== null) {
+        io.emit("message", { token: token, message: "Logout Progres.." });
+    }
+
+    try {
+        if (typeof sock[token] === "undefined") {
+            const status = await connectWaBeforeSend(token);
+            if (status) {
+                sock[token].logout();
+                delete sock[token];
+            }
+        } else {
+            sock[token].logout();
+            delete sock[token];
+        }
+        delete qrcode[token];
+        clearInterval(intervalStore[token]);
+
+        if (io != null) {
+            io.emit("Unauthorized", token);
+            io.emit("message", {
+                token: token,
+                message: "Connection closed. You are logged out.",
+            });
+        }
+        if (fs.existsSync(`./credentials/${token}`)) {
+            fs.rmSync(
+                `./credentials/${token}`,
+                { recursive: true, force: true },
+                (err) => {
+                    if (err) console.log(err);
+                }
+            );
+        }
+
+        return {
+            status: true,
+            message: "Deleting session and credential",
+        };
+    } catch (error) {
+        console.log(error);
+        return {
+            status: true,
+            message: "Nothing deleted",
+        };
+    }
+}
+
+export {
+    connectToWhatsApp,
+    sendTextMessage,
+    isExist,
+    connectWaBeforeSend,
+    getPpUrl,
+    logoutDevice,
+    checkUserToken,
+    getGroup,
+    getContacts
+}
